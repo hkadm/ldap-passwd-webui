@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-
+# not working abort change pass
 import bottle
+import ldap
+import ldap.modlist as modlist
 from bottle import get, post, static_file, request, route, template
 from bottle import SimpleTemplate
 from configparser import ConfigParser
@@ -58,14 +60,29 @@ def index_tpl(**kwargs):
     return template('index', **kwargs)
 
 
-def connect_ldap(conf, **kwargs):
-    server = Server(host=conf['host'],
+def connect_ipa(conf, **kwargs):
+    server = Server(host=conf['host_ipa'],
                     port=conf.getint('port', None),
                     use_ssl=conf.getboolean('use_ssl', False),
                     connect_timeout=5)
 
     return Connection(server, raise_exceptions=True, **kwargs)
 
+def connect_ad(conf, **kwargs):
+    server = Server(host=conf['host_ad'],
+                    port=conf.getint('port', None),
+                    use_ssl=conf.getboolean('use_ssl', False),
+                    connect_timeout=5)
+
+    return Connection(server, raise_exceptions=True, **kwargs)
+
+def connect_mfa(conf, **kwargs):
+    server = Server(host=conf['host_mfa'],
+                    port=conf.getint('port_mfa', None),
+                    use_ssl=conf.getboolean('use_ssl_mfa', False),
+                    connect_timeout=30)
+
+    return Connection(server, raise_exceptions=True, **kwargs)
 
 def change_passwords(username, old_pass, new_pass):
     changed = []
@@ -81,19 +98,17 @@ def change_passwords(username, old_pass, new_pass):
             for key in reversed(changed):
                 LOG.info("Reverting password change in %s for %s" % (key, username))
                 try:
-                    change_password(CONF[key], username, new_pass, old_pass)
+                    abort_change_password(CONF[key], username, new_pass, old_pass)
                 except Error as e2:
                     LOG.error('{}: {!s}'.format(e.__class__.__name__, e2))
             raise e
-
 
 def change_password(conf, *args):
     try:
         if conf.get('type') == 'ad':
             change_password_ad(conf, *args)
         else:
-            change_password_ldap(conf, *args)
-
+            verify_mfa(conf, *args)
     except (LDAPBindError, LDAPInvalidCredentialsResult, LDAPUserNameIsMandatoryError):
         raise Error('Username or password is incorrect!')
 
@@ -110,29 +125,66 @@ def change_password(conf, *args):
         LOG.error('{}: {!s}'.format(e.__class__.__name__, e))
         raise Error('Encountered an unexpected error while communicating with the remote server.')
 
+def abort_change_password(conf, *args):
+    try:
+        if conf.get('type') == 'ad':
+            change_password_ad(conf, *args)
+        else:
+            change_password_ipa(conf, *args)
+    except (LDAPBindError, LDAPInvalidCredentialsResult, LDAPUserNameIsMandatoryError):
+        raise Error('Username or password is incorrect!')
 
-def change_password_ldap(conf, username, old_pass, new_pass):
-    with connect_ldap(conf) as c:
+    except LDAPConstraintViolationResult as e:
+        # Extract useful part of the error message (for Samba 4 / AD).
+        msg = e.message.split('check_password_restrictions: ')[-1].capitalize()
+        raise Error(msg)
+
+    except LDAPSocketOpenError as e:
+        LOG.error('{}: {!s}'.format(e.__class__.__name__, e))
+        raise Error('Unable to connect to the remote server.')
+
+    except LDAPExceptionError as e:
+        LOG.error('{}: {!s}'.format(e.__class__.__name__, e))
+        raise Error('Encountered an unexpected error while communicating with the remote server.')
+
+def verify_mfa(conf, username, old_pass, new_pass):
+    with connect_ipa(conf) as c:
+        user_dn = find_user_dn(conf, c, username)
+
+    with connect_mfa(conf, authentication=SIMPLE, user=user_dn, password=old_pass) as c:
+        user_dn = find_user_dn(conf, c, username)
+
+#    with connect_ipa(conf, authentication=SIMPLE, user=user_dn, password=old_pass) as c:
+#        c.bind()
+#        c.extend.standard.modify_password(user_dn, old_pass, new_pass)
+
+
+def change_password_ipa(conf, username, old_pass, new_pass):
+    with connect_ipa(conf) as c:
         user_dn = find_user_dn(conf, c, username)
 
     # Note: raises LDAPUserNameIsMandatoryError when user_dn is None.
-    with connect_ldap(conf, authentication=SIMPLE, user=user_dn, password=old_pass) as c:
+    with connect_ipa(conf, authentication=SIMPLE, user=user_dn, password=old_pass) as c:
         c.bind()
         c.extend.standard.modify_password(user_dn, old_pass, new_pass)
 
 
 def change_password_ad(conf, username, old_pass, new_pass):
     user = username + '@' + conf['ad_domain']
-
-    with connect_ldap(conf, authentication=SIMPLE, user=user, password=old_pass) as c:
+    with connect_ad(conf, authentication=SIMPLE, user=user, password=old_pass) as c:
         c.bind()
-        user_dn = find_user_dn(conf, c, username)
-        c.extend.microsoft.modify_password(user_dn, new_pass, old_pass)
+        user_dn_ad = find_user_dn_ad(conf, c, username)
+        c.extend.microsoft.modify_password(user_dn_ad, new_pass, old_pass)
 
+def find_user_dn_ad(conf, conn, uid):
+    search_filter = conf['search_filter_ad'].replace('{uidad}', uid)
+    conn.search(conf['base_ad'], "(%s)" % search_filter, SUBTREE)
+
+    return conn.response[0]['dn'] if conn.response else None
 
 def find_user_dn(conf, conn, uid):
-    search_filter = conf['search_filter'].replace('{uid}', uid)
-    conn.search(conf['base'], "(%s)" % search_filter, SUBTREE)
+    search_filter = conf['search_filter_ipa'].replace('{uid}', uid)
+    conn.search(conf['base_ipa'], "(%s)" % search_filter, SUBTREE)
 
     return conn.response[0]['dn'] if conn.response else None
 
